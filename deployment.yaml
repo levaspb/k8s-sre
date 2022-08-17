@@ -1,0 +1,125 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name:  mindbox
+  namespace: default
+  labels:
+    app:  mindbox
+spec:
+  selector:
+    matchLabels:
+      app: mindbox
+  # Максимально нам требуется 4 реплики, минимально 2. Устанавливаем минимальное значение, которое затем
+  # при необходимости скейлится при помощи HorizontalPodAutoscaler (описание ниже)
+  replicas: 2
+  # При обновлении обеспечиваем постоянную доступность
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app:  mindbox
+    spec:
+      containers:
+      - name:  mindbox 
+        # Для теста использовал образ httpd, поскольку он предсказуемо быстро запускается и 
+        # выдает статичную страницу на 80 порту
+        image:  httpd
+        ports:
+        - containerPort:  80
+          name:  mindbox
+        # Симулируем долгую инициализацию приложения (спим от 5 до 10 секунд)
+        command: ["/bin/sh"]
+        args: ['-c', "sleep $(expr 5 + $RANDOM % 6);httpd-foreground"]
+        imagePullPolicy: IfNotPresent
+        # Выделяем ресурсы в соответствии с описанием приложения  
+        resources:
+          requests:
+            cpu: 200m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi
+        # Используем пробу запуска, поскольку процесс инициализации приложения непредсказуем
+        # Пользовался при принятии решений двумя источниками:
+        # https://habr.com/en/company/vk/blog/530752/
+        # https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
+        startupProbe:
+          httpGet:
+            # Исходим из того, что у приложения нет облегченного http-сервера для проверки
+            path: / # иначе что-нибудь вроде /healthz
+            port: 80
+          # Количество секунд ожидания перед запуском проверки работоспособности или готовности
+          # Устанавливаем 5, поскольку знаем, что раньше приложение точно не инициализируется
+          initialDelaySeconds: 5
+          # Количество секунд до отметки тайм-аута пробы (проверка работоспособности дала сбой)
+          # Если нет ответа 2 секунды, значит приложение еще не готово
+          timeoutSeconds: 2
+          # Достаточно одной успешной проверки, чтобы понять, что инициализация завершена
+          successThreshold: 1
+          # Устанавливаем с запасом количество попыток до пометки пробы как неудачной
+          # Если инициализация приложение занимает больше 30 секунд (5+5*5), значит что-то пошло не так
+          failureThreshold: 5
+          # Проверяем пробу каждые 5 секунд, поскольку ожидаем, что инициализация не займет больше 10 секунд  
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: / # /healthz
+            port: 80
+          # Начинаем следить за состоянием пода только после истечения максимального времени для инициализации
+          initialDelaySeconds: 30
+          failureThreshold: 1
+          periodSeconds: 10
+      restartPolicy: Always
+      # Обеспечиваем распределение подов по нодам в разных зонах
+      topologySpreadConstraints:
+      - maxSkew: 1
+        # Топология определяется зоной, которая в случае Google Kubernetes Engine (где проводился тест)
+        # задается в следующей метке
+        topologyKey: topology.kubernetes.io/zone
+        # Если не получается хорошая балансировка, не размещаем под, ждем ноду 
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: mindbox
+---
+apiVersion: autoscaling/v2beta2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mindbox
+spec:
+  # Поскольку мы знаем, что 4 пода справляются с любой нагрузкой, максимальное количество реплик 4
+  maxReplicas: 4
+  # Минимальное количество реплик для обеспечение постоянной доступности
+  minReplicas: 2
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mindbox
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        # Если использование CPU вырастает до 50% от запрошенного ресурса, увеличиваем количество реплик
+        # Запрошено 200m, обычное потребление 100m, логика: при превышении обычной нагрузки скейл
+        averageUtilization: 50
+        # Если нагрузка из-за обработки первых запросов будет приводить к тому, что количество реплик
+        # начнет расти, можно будет прописать политику upscale как описано здесь:
+        # https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mindbox
+spec:
+  selector:
+    app: mindbox
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 80
